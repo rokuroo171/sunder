@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -43,9 +45,52 @@ type ephSession struct {
 
 // Server owns the handshake state and the shard registry
 type Server struct {
-	mu     sync.Mutex
-	shards map[string]*shardEntry
-	eph    map[string]ephSession
+	mu      sync.Mutex
+	shards  map[string]*shardEntry
+	eph     map[string]ephSession
+	onEvent func(string)
+}
+
+// SetEventHandler installs a sink for lifecycle narration; when nil the
+// server falls back to the standard logger
+func (s *Server) SetEventHandler(fn func(string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onEvent = fn
+}
+
+func (s *Server) emit(msg string) {
+	s.mu.Lock()
+	fn := s.onEvent
+	s.mu.Unlock()
+	if fn != nil {
+		fn(msg)
+		return
+	}
+	log.Print(msg)
+}
+
+// ListShards returns the registry as a stable snapshot ordered by first seen
+func (s *Server) ListShards() []Shard {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	shards := make([]Shard, 0, len(s.shards))
+	for _, entry := range s.shards {
+		shards = append(shards, entry.shard)
+	}
+	sort.Slice(shards, func(i, j int) bool { return shards[i].FirstSeen.Before(shards[j].FirstSeen) })
+	return shards
+}
+
+// ShardByID returns the registry record for one shard id
+func (s *Server) ShardByID(id string) (Shard, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.shards[id]
+	if !ok {
+		return Shard{}, false
+	}
+	return entry.shard, true
 }
 
 // NewServer creates an empty whisper server
@@ -154,7 +199,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		key: key,
 	}
 	s.mu.Unlock()
-	log.Printf("[shard %s] registered: %s/%s user=%s host=%s", hello.ID, hello.OS, hello.Arch, hello.User, hello.Hostname)
+	s.emit(fmt.Sprintf("[shard %s] registered: %s/%s user=%s host=%s", hello.ID, hello.OS, hello.Arch, hello.User, hello.Hostname))
 	respEnv, err := Seal(key, mustJSON(ack))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -199,10 +244,10 @@ func (s *Server) handleWord(w http.ResponseWriter, r *http.Request) {
 		entry.shard.LastBreath = now
 		s.mu.Unlock()
 		res = WordResult{Word: word.Word, OK: true, Result: "alive", TS: now.Unix()}
-		log.Printf("[shard %s] breath: alive", word.ShardID)
+		s.emit(fmt.Sprintf("[shard %s] breath: alive", word.ShardID))
 	default:
 		res = WordResult{Word: word.Word, OK: false, Result: "unknown word", TS: time.Now().Unix()}
-		log.Printf("[shard %s] unknown word: %s", word.ShardID, word.Word)
+		s.emit(fmt.Sprintf("[shard %s] unknown word: %s", word.ShardID, word.Word))
 	}
 	respEnv, err := Seal(entry.key, mustJSON(res))
 	if err != nil {
@@ -213,13 +258,7 @@ func (s *Server) handleWord(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleShards(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	shards := make([]Shard, 0, len(s.shards))
-	for _, entry := range s.shards {
-		shards = append(shards, entry.shard)
-	}
-	writeJSON(w, http.StatusOK, shards)
+	writeJSON(w, http.StatusOK, s.ListShards())
 }
 
 func randomHex(n int) string {

@@ -1,6 +1,6 @@
 .PHONY: overseer run vet test wraith fmt clean
 
-VERSION ?= 0.1.1
+VERSION ?= 0.2.0
 
 overseer:
 	cd overseer && go build -ldflags "-X main.version=$(VERSION)" -o bin/overseer ./cmd/overseer

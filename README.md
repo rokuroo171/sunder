@@ -22,8 +22,7 @@ The full design lives in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Current state
 
-This repository is a scaffold. The first milestone is a working **Whisper v1
-handshake over HTTPS**:
+The **Whisper v1 handshake over HTTPS** works end to end:
 
 1. The Wraith connects to the Overseer over TLS
 2. Both sides exchange ephemeral X25519 keys
@@ -31,28 +30,38 @@ handshake over HTTPS**:
 4. All further payloads are sealed with AES-256-GCM
 5. The Wraith registers as a Shard and proves the loop with a `breath` word
 
-The full design calls for the Noise protocol, dead drops, mesh relays, and the
-WASM fragment runtime. Those land in later milestones. The scaffold handshake
-is honest about being a scaffold: ephemeral keys, no persistence, no job queue
-beyond the single `breath` word.
+On top of that wire, v0.2.0 adds the **Overseer console**: run the Overseer
+on a terminal and it drops you into `user@sunder:~$` with `shards`, `grasp`,
+`breath`, and `tone`, while Shard registrations and heartbeats narrate
+behind the prompt. The full design calls for the Noise protocol, dead drops,
+mesh relays, and the WASM fragment runtime; those land in later milestones.
 
 ## Quick start
 
 ```sh
 # build and run the Overseer (requires Go 1.24+)
 make overseer
-make run
+make run        # on a tty this drops you into the console
 
 # in another shell, beacon with the Wraith (requires a Rust toolchain)
-cd wraith && cargo run -- https://localhost:8443
-
-# or beacon continuously, one breath every 5 seconds
 cd wraith && cargo run -- https://localhost:8443 --loop --interval 5
 ```
 
-The Overseer serves a self-signed certificate generated at startup. The
-Wraith accepts any certificate in this scaffold build, dev only, for a local
-handshake. Certificate pinning and proper trust belong to a later milestone.
+Inside the console, watch a Shard land and speak to it:
+
+```
+rokuroo@sunder:~$ shards
+rokuroo@sunder:~$ grasp 71d9d655
+You have its ear.
+rokuroo@sunder:~$ breath
+It breathes, shallow and patient.
+```
+
+Run `overseer -headless` to serve without the console, or `overseer -console`
+to force the console when stdin is not a tty. The Overseer serves a
+self-signed certificate generated at startup. The Wraith accepts any
+certificate in this scaffold build, dev only, for a local handshake.
+Certificate pinning and proper trust belong to a later milestone.
 
 ## Authorized use
 
