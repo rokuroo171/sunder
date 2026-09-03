@@ -123,8 +123,9 @@ Sample register:
 
 | Moment | Voice |
 |---|---|
-| `breath` alive | "It breathes, shallow and patient." / "Alive. It dreams in page faults." |
-| `breath` unreachable | "Silence. The wire is cold." |
+| `breath` breathing | "It breathes, shallow and patient." / "Alive. It dreams in page faults." |
+| `breath` silent | "It holds its breath." |
+| `breath` dark | "Silence. The wire is cold." |
 | `grasp` success | "You have its ear." |
 | `shards` empty | "No shards. The blade is whole, for now." |
 | `cast` complete | "A shard leaves the blade." |
@@ -212,6 +213,19 @@ Sample register:
 | `wards` | Firewall rules and state (`-l` list, per-profile) |
 | `rank` | Integrity or privilege level (Windows); uid, gid, capabilities (Unix) |
 
+> **Note on `eavesdrop` and the platform walls.** The honest map of what a
+> keylogger can hear changes with the display stack. An X11 session exposes
+> every keystroke to any client: the XRecord extension was built as a session
+> recording facility, and no grab or focus is required. Wayland was designed
+> to end that. The compositor owns input and delivers keys only to the
+> focused client, so no client API can hear the desktop, and a global
+> keylogger is impossible by protocol design. Under XWayland, capture
+> reaches only other X11 clients, and only while one of them holds focus.
+> The captures that remain on a Wayland desktop are evdev as root (below the
+> whole display stack), an input method the user consented to, or an X11
+> holdout. `eavesdrop` must detect which world it landed in and report what
+> it can actually hear, and say plainly when the wall holds.
+
 ### 3.4 Incantations: Execution (speaking things into being)
 
 | Word | Function |
@@ -287,6 +301,32 @@ Anchors are first-class: a Shard may hold several, each logged in the
 Auditor's footprint ledger (mechanism, name, location) so `drift` and
 `immolate` are precise. The tethered prompt state signals the accepted
 on-disk footprint.
+
+**The userland covenant.** `anchor` answers one question: whether the implant
+returns after a reboot. It never answers the rootkit's question, whether the
+OS can see the implant at all, and the design stops at that line. Anchors
+are userland (ring 3) mechanisms only: no kernel or boot-start drivers, no
+bootloader or firmware hooks, and no self-hiding. Four reasons hold the
+line. Removability: `drift` can reliably remove a scheduled task; it cannot
+repair a boot chain. Reliability: userland persistence survives OS updates
+and Secure Boot, where kernel persistence breaks on exactly those. The
+malware line: rootkit behavior is what makes antivirus classify a binary
+with no nuance. Accountability: a defender can find an anchor, and that is
+the accepted risk of authorized testing. Process injection stays on the same
+side of the line: hollowing lives inside another userland process the OS
+still manages, and it hides nothing from the OS. Injection is evasion;
+subversion is a rootkit. Persistence always costs a disk artifact: RAM is
+wiped by reboot, so an anchor's job is pointing the OS back at a file, and
+the tethered prompt states exactly that price.
+
+**The anchor adapts; the boot does not.** Linux anchors detect the init
+system rather than assume one, checked in order: `/run/systemd/system`
+(systemd), `/sbin/openrc` (OpenRC), `/etc/init.d` (SysV), `/etc/sv` (runit
+or s6), `/etc/inittab` (busybox). So `anchor -m` on Linux accepts `systemd`,
+`openrc`, `sysv`, `runit`, and `inittab` as mechanisms alongside the
+Windows and macOS set (task, wmi, service, startup, launchd, registry).
+Whatever the init system, the sequence on wake is identical (see the life
+and death of a Shard, §5).
 
 ### 3.8 Pivoting and Movement
 
@@ -413,6 +453,75 @@ Words to Lines to Cantos to Saga. The poetry is the automation architecture.
 - **Egress auto-probe**: the Wraith tests which egress paths work (443
   blocked? try 53, try a Raven) and self-switches. Operators pick a policy;
   the implant adapts.
+
+### The life and death of a Shard
+
+A Shard is either breathing or it is not, and the Overseer must never guess
+which. The Wraith beacons and is never polled, so the controller can never
+ask a dead Shard anything. Presence is therefore registry truth with age,
+tracked through a state ladder:
+
+| State | Condition | The console shows |
+|---|---|---|
+| breathing | last breath within grace (cadence times a jitter-aware multiplier) | "It breathes, shallow and patient." |
+| silent | one or two beats missed, still inside grace | "It holds its breath." |
+| dark | grace expired | "Silence. The wire is cold." |
+| ash | immolated, or its doom confirmed | "It is ash." |
+
+A `breath` on a dark Shard does not hang and does not error. It reports the
+registry truth with the age of the silence: how long since the last breath
+and how many beats were missed. A reaper on the Overseer walks the ladder
+for every Shard, breathing to silent to dark, and narrates the crossing at
+the console so an operator notices a lost Shard without polling. `shards`
+and the Whisper registry endpoint carry the state column, so the console,
+the verse, and the API always agree.
+
+Offline is not death, and the difference is the anchor:
+
+- **Sleep.** The process suspends with the machine and resumes on wake,
+  breathing again. The Overseer sees a silent gap, then beacons resume.
+- **Shutdown, unanchored.** The Wraith dies with the machine and is not
+  there when it returns. The operator casts again. That is the honest life
+  of an unanchored implant.
+- **Shutdown, anchored.** The process dies, but the anchor survives on
+  disk. Reboot relaunches it and the Shard returns from the dark. An
+  anchored Wraith cannot die, only wait.
+- **Doom on boot.** If the kill date passed while the machine was off, the
+  anchored Wraith burns its own anchors and immolates before its first
+  beacon. A dead order cannot resurrect.
+
+Return from the dark depends on stable identity. `cast` embeds a shard id,
+alongside the controller URL and cadence, into the binary, so every respawn
+presents the same face. When a known id re-registers after going dark, the
+Overseer reconciles: it logs the return and refreshes the session instead of
+registering a stranger.
+
+**The boot sequence.** An anchored Wraith never breathes during boot
+initialization, on any OS. Anchors are userland, and nothing userland runs
+at the kernel phase: on Windows, services fire only after the Service
+Control Manager starts, and logon tasks wait for a session; on Linux, units
+fire once the init system resolves their dependencies. Breathing also
+requires the network, and no init system can be trusted to order it,
+especially SysV, runit, and busybox inits, which have no dependency system
+at all. The sequence is therefore universal: spawn when the anchor fires,
+probe for network readiness, retry with the backoff `patience` sets, check
+`doom`, and only then breathe. The first breath lands seconds to a minute
+after boot, never at init, and deliberately not instant: the loudest moment
+of a boot is the worst time to beacon. The anchor adapts to the init
+system; the boot behavior never does (see §3.7).
+
+**The cost of tenacity.** Anchors trade footprint for survival, and the
+ranking is the same on every OS. On Windows, an auto-start service as
+SYSTEM or an equivalent boot-time scheduled task is the tenacious choice:
+both run with no user logged in. On Linux it is a systemd unit as root with
+restart on failure; on macOS, a LaunchDaemon. WMI event subscriptions
+survive reboot and stay nearly invisible to admins, but endpoint defense
+watches them. Per-logon mechanisms, run keys, logon tasks, and
+LaunchAgents, are weaker and relaunch the Wraith per session, so the Wraith
+checks for an existing instance before a second one breathes. Anchoring
+several mechanisms buys redundancy at multiplied footprint, which is
+exactly why the Auditor's ledger counts every anchor: what cannot be
+counted cannot be cleaned.
 
 ### Shards and Fragments (the WASM module runtime)
 
@@ -595,6 +704,8 @@ that space.
 - Whisper comms: Noise over HTTPS, AES-256-GCM sessions, job loop.
 - Built-in Words: `utter`, `gaze`, `unfold`, `lift`, `bestow`, `pulse`,
   `anatomy`, `breath`, `shards`, `grasp`.
+- Presence registry: the state ladder (breathing, silent, dark, ash), the
+  reaper, and return reconciliation for known shard ids.
 - Remote Unix-style output shims on the Wraith.
 - Auditor skeleton (Word risk scores) plus Ledger basics.
 - Local passthrough bridge in the console.
