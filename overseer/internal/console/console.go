@@ -14,10 +14,24 @@ import (
 	"sunder/overseer/internal/whisper"
 )
 
+const taskWait = 90 * time.Second
+
 // Registry is the shard store the console reads from
 type Registry interface {
 	ListShards() []whisper.Shard
 	ShardByID(id string) (whisper.Shard, bool)
+}
+
+// Tasker queues Words for a Shard and waits on their answers
+type Tasker interface {
+	QueueTask(shardID, word string, args map[string]string) (string, error)
+	WaitTaskResult(taskID string, timeout time.Duration) (whisper.TaskResult, error)
+}
+
+// Controller is everything the console reads and speaks through
+type Controller interface {
+	Registry
+	Tasker
 }
 
 var errExit = errors.New("exit")
@@ -26,6 +40,7 @@ var errInterrupted = errors.New("interrupted")
 // Console is the Overseer REPL
 type Console struct {
 	reg     Registry
+	tasks   Tasker
 	in      *bufio.Reader
 	out     io.Writer
 	events  <-chan string
@@ -35,11 +50,12 @@ type Console struct {
 	editor  *termEditor
 }
 
-// New builds a console over a registry and an input stream
-func New(reg Registry, in io.Reader, out io.Writer, events <-chan string) *Console {
+// New builds a console over a controller and an input stream
+func New(ctrl Controller, in io.Reader, out io.Writer, events <-chan string) *Console {
 	user := osUser()
 	c := &Console{
-		reg:    reg,
+		reg:    ctrl,
+		tasks:  ctrl,
 		in:     bufio.NewReader(in),
 		out:    out,
 		events: events,
@@ -125,6 +141,8 @@ func (c *Console) exec(line string) error {
 		return c.doGrasp(args)
 	case "breath":
 		return c.doBreath(args)
+	case "utter", "gaze", "unfold", "pulse", "anatomy":
+		return c.doWord(word, args)
 	default:
 		return fmt.Errorf("unknown word: %s (try help)", word)
 	}
@@ -196,6 +214,93 @@ func (c *Console) doBreath(args []string) error {
 	return nil
 }
 
+// doWord queues a Word for the grasped shard and prints its answer
+func (c *Console) doWord(word string, args []string) error {
+	if c.grasped == "" {
+		return errors.New("grasp a shard first, then speak")
+	}
+	a, err := wordArgs(word, args)
+	if err != nil {
+		return err
+	}
+	taskID, err := c.tasks.QueueTask(c.grasped, word, a)
+	if err != nil {
+		return err
+	}
+	res, err := c.tasks.WaitTaskResult(taskID, taskWait)
+	if err != nil {
+		if c.voice == "verse" {
+			c.outln("It does not answer.")
+			return nil
+		}
+		return err
+	}
+	if !res.OK {
+		if res.Result == "" {
+			c.outln("failed")
+		} else {
+			c.outln("failed: " + res.Result)
+		}
+		return nil
+	}
+	if res.Result == "" {
+		c.outln("(no output)")
+	} else {
+		c.outln(res.Result)
+	}
+	return nil
+}
+
+// wordArgs maps a Word's command line onto the wire args
+func wordArgs(word string, args []string) (map[string]string, error) {
+	a := make(map[string]string)
+	switch word {
+	case "utter":
+		var cmd []string
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "-t":
+				if i+1 >= len(args) {
+					return nil, errors.New("usage: utter [-t seconds] <command>")
+				}
+				i++
+				a["t"] = args[i]
+			default:
+				cmd = append(cmd, args[i])
+			}
+		}
+		if len(cmd) == 0 {
+			return nil, errors.New("usage: utter [-t seconds] <command>")
+		}
+		a["command"] = strings.Join(cmd, " ")
+	case "gaze":
+		if len(args) > 0 {
+			a["path"] = args[0]
+		}
+	case "unfold":
+		var pos []string
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "-o", "-n", "-t":
+				if i+1 >= len(args) {
+					return nil, errors.New("usage: unfold <path> [-o offset] [-n bytes] [-t text|hex|base64]")
+				}
+				i++
+				a[strings.TrimPrefix(args[i-1], "-")] = args[i]
+			default:
+				pos = append(pos, args[i])
+			}
+		}
+		if len(pos) == 0 {
+			return nil, errors.New("usage: unfold <path> [-o offset] [-n bytes] [-t text|hex|base64]")
+		}
+		a["path"] = pos[0]
+	case "pulse", "anatomy":
+		// nothing to parse yet
+	}
+	return a, nil
+}
+
 func (c *Console) doVoice(args []string) error {
 	if len(args) != 1 {
 		c.outln("usage: tone verse|plain|quiet")
@@ -226,6 +331,11 @@ func (c *Console) printHelp() {
 	c.outln("  shards      list deployed shards and their breath")
 	c.outln("  grasp       hook into a shard by id or host")
 	c.outln("  breath      heartbeat check of the grasped shard")
+	c.outln("  utter       run a command on the grasped shard")
+	c.outln("  gaze        list a directory on the grasped shard")
+	c.outln("  unfold      read a file on the grasped shard")
+	c.outln("  pulse       list processes on the grasped shard")
+	c.outln("  anatomy     system information on the grasped shard")
 	c.outln("  tone        console voice: verse, plain, quiet")
 	c.outln("  clear       clear the console")
 	c.outln("  exit        leave the console")

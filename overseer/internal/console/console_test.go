@@ -12,6 +12,8 @@ import (
 
 type fakeReg struct {
 	shards []whisper.Shard
+	queued map[string]string
+	result whisper.TaskResult
 }
 
 func (f *fakeReg) ListShards() []whisper.Shard { return f.shards }
@@ -25,7 +27,20 @@ func (f *fakeReg) ShardByID(id string) (whisper.Shard, bool) {
 	return whisper.Shard{}, false
 }
 
-func runConsole(t *testing.T, reg Registry, input string) string {
+func (f *fakeReg) QueueTask(shardID, word string, args map[string]string) (string, error) {
+	f.queued = make(map[string]string)
+	f.queued["word"] = word
+	for k, v := range args {
+		f.queued[k] = v
+	}
+	return "task-1", nil
+}
+
+func (f *fakeReg) WaitTaskResult(taskID string, timeout time.Duration) (whisper.TaskResult, error) {
+	return f.result, nil
+}
+
+func runConsole(t *testing.T, reg Controller, input string) string {
 	t.Helper()
 	var out bytes.Buffer
 	c := New(reg, strings.NewReader(input), &out, nil)
@@ -116,9 +131,75 @@ func TestUnknownWord(t *testing.T) {
 
 func TestHelpListsWords(t *testing.T) {
 	out := runConsole(t, &fakeReg{}, "help\nexit\n")
-	for _, w := range []string{"shards", "grasp", "breath", "tone"} {
+	for _, w := range []string{"shards", "grasp", "breath", "tone", "utter", "gaze", "unfold", "pulse", "anatomy"} {
 		if !strings.Contains(out, w) {
 			t.Fatalf("help missing %s: %q", w, out)
 		}
+	}
+}
+
+func TestUtterRunsOnGraspedShard(t *testing.T) {
+	reg := &fakeReg{
+		shards: []whisper.Shard{shard("deadbeefcafe", 5, time.Now())},
+		result: whisper.TaskResult{TaskID: "task-1", Word: "utter", OK: true, Result: "hello from the far side"},
+	}
+	out := runConsole(t, reg, "grasp deadbeef\nutter echo hello\nexit\n")
+	if !strings.Contains(out, "hello from the far side") {
+		t.Fatalf("missing utter result: %q", out)
+	}
+	if reg.queued["word"] != "utter" || reg.queued["command"] != "echo hello" {
+		t.Fatalf("wrong task queued: %+v", reg.queued)
+	}
+}
+
+func TestUtterRequiresGrasp(t *testing.T) {
+	out := runConsole(t, &fakeReg{}, "utter echo hi\nexit\n")
+	if !strings.Contains(out, "grasp a shard first") {
+		t.Fatalf("missing grasp guidance: %q", out)
+	}
+}
+
+func TestUtterTimeoutFlag(t *testing.T) {
+	reg := &fakeReg{shards: []whisper.Shard{shard("deadbeefcafe", 5, time.Now())}}
+	out := runConsole(t, reg, "grasp deadbeef\nutter -t 3 sleep 5\nexit\n")
+	if reg.queued["t"] != "3" || reg.queued["command"] != "sleep 5" {
+		t.Fatalf("wrong utter args: %+v", reg.queued)
+	}
+	if strings.Contains(out, "usage:") {
+		t.Fatalf("timeout flag should parse: %q", out)
+	}
+}
+
+func TestUnfoldBuildsArgs(t *testing.T) {
+	reg := &fakeReg{shards: []whisper.Shard{shard("deadbeefcafe", 5, time.Now())}}
+	out := runConsole(t, reg, "grasp deadbeef\nunfold /etc/hostname -o 2 -n 4 -t hex\nexit\n")
+	if reg.queued["word"] != "unfold" ||
+		reg.queued["path"] != "/etc/hostname" ||
+		reg.queued["o"] != "2" ||
+		reg.queued["n"] != "4" ||
+		reg.queued["t"] != "hex" {
+		t.Fatalf("wrong unfold args: %+v", reg.queued)
+	}
+	if strings.Contains(out, "usage:") {
+		t.Fatalf("unfold flags should parse: %q", out)
+	}
+}
+
+func TestGazePassesPath(t *testing.T) {
+	reg := &fakeReg{shards: []whisper.Shard{shard("deadbeefcafe", 5, time.Now())}}
+	runConsole(t, reg, "grasp deadbeef\ngaze /tmp\nexit\n")
+	if reg.queued["word"] != "gaze" || reg.queued["path"] != "/tmp" {
+		t.Fatalf("wrong gaze args: %+v", reg.queued)
+	}
+}
+
+func TestFailedWordResult(t *testing.T) {
+	reg := &fakeReg{
+		shards: []whisper.Shard{shard("deadbeefcafe", 5, time.Now())},
+		result: whisper.TaskResult{TaskID: "task-1", Word: "utter", OK: false, Result: "exit: 1"},
+	}
+	out := runConsole(t, reg, "grasp deadbeef\nutter false\nexit\n")
+	if !strings.Contains(out, "failed: exit: 1") {
+		t.Fatalf("missing failure text: %q", out)
 	}
 }

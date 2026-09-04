@@ -48,6 +48,13 @@ func main() {
 		default:
 		}
 	})
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			server.Reap()
+		}
+	}()
 	hs := &http.Server{
 		Handler:   server,
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},

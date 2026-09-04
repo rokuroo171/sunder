@@ -78,26 +78,26 @@ func (c *Client) Handshake(hello Hello) (Ack, error) {
 	return ack, nil
 }
 
-// Word sends one sealed task and returns the sealed answer
-func (c *Client) Word(word string, args map[string]string) (WordResult, error) {
-	var res WordResult
-	env, err := Seal(c.key, mustJSON(Word{ShardID: c.shardID, Word: word, Args: args}))
+// Beat sends one sealed check in and returns the server answer
+func (c *Client) Beat(result *TaskResult) (BeatAck, error) {
+	var ack BeatAck
+	env, err := Seal(c.key, mustJSON(BeatReq{ShardID: c.shardID, Result: result}))
 	if err != nil {
-		return res, err
+		return ack, err
 	}
-	req := wordRequest{ShardID: c.shardID, Envelope: env}
+	req := BeatPost{ShardID: c.shardID, Envelope: env}
 	var respEnv Envelope
-	if err := c.postJSON("/whisper/v1/word", req, &respEnv); err != nil {
-		return res, err
+	if err := c.postJSON("/whisper/v1/beat", req, &respEnv); err != nil {
+		return ack, err
 	}
-	resPlain, err := Open(c.key, respEnv)
+	plain, err := Open(c.key, respEnv)
 	if err != nil {
-		return res, err
+		return ack, err
 	}
-	if err := json.Unmarshal(resPlain, &res); err != nil {
-		return res, err
+	if err := json.Unmarshal(plain, &ack); err != nil {
+		return ack, err
 	}
-	return res, nil
+	return ack, nil
 }
 
 func (c *Client) getJSON(path string, out any) error {

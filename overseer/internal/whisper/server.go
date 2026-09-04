@@ -20,6 +20,12 @@ const (
 	defaultCadenceSec = 5
 )
 
+const (
+	stateBreathing = "breathing"
+	stateSilent    = "silent"
+	stateDark      = "dark"
+)
+
 // Shard is the public record of a connected Wraith
 type Shard struct {
 	ID         string    `json:"id"`
@@ -36,6 +42,7 @@ type Shard struct {
 type shardEntry struct {
 	shard Shard
 	key   SessionKey
+	state string
 }
 
 type ephSession struct {
@@ -43,10 +50,12 @@ type ephSession struct {
 	expires time.Time
 }
 
-// Server owns the handshake state and the shard registry
+// Server owns the handshake state, the task queues, and the shard registry
 type Server struct {
 	mu      sync.Mutex
 	shards  map[string]*shardEntry
+	pending map[string][]*Task
+	done    map[string]TaskResult
 	eph     map[string]ephSession
 	onEvent func(string)
 }
@@ -93,11 +102,104 @@ func (s *Server) ShardByID(id string) (Shard, bool) {
 	return entry.shard, true
 }
 
+// QueueTask queues one Word for a Shard and returns its task id
+func (s *Server) QueueTask(shardID, word string, args map[string]string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.shards[shardID]; !ok {
+		return "", errors.New("whisper: unknown shard")
+	}
+	task := &Task{ID: randomHex(8), Word: word, Args: args}
+	s.pending[shardID] = append(s.pending[shardID], task)
+	return task.ID, nil
+}
+
+// WaitTaskResult blocks until the Shard answers a task or the timeout passes
+func (s *Server) WaitTaskResult(taskID string, timeout time.Duration) (TaskResult, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		res, ok := s.done[taskID]
+		if ok {
+			delete(s.done, taskID)
+		}
+		s.mu.Unlock()
+		if ok {
+			return res, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return TaskResult{}, fmt.Errorf("whisper: task %s went unanswered for %s", taskID, timeout)
+}
+
+// Reap walks the presence ladder and narrates crossings into silence or the dark
+func (s *Server) Reap() {
+	now := time.Now()
+	type crossing struct {
+		id       string
+		state    string
+		lastTime time.Time
+		cadence  int
+	}
+	s.mu.Lock()
+	var crosses []crossing
+	for id, e := range s.shards {
+		cad := time.Duration(e.shard.CadenceS) * time.Second
+		if cad <= 0 {
+			cad = defaultCadenceSec * time.Second
+		}
+		age := now.Sub(e.shard.LastBreath)
+		st := stateBreathing
+		if age > 2*cad {
+			st = stateSilent
+		}
+		if age > 5*cad {
+			st = stateDark
+		}
+		if e.state == "" {
+			e.state = st
+		} else if stateRank(st) > stateRank(e.state) {
+			e.state = st
+			crosses = append(crosses, crossing{id: id, state: st, lastTime: e.shard.LastBreath, cadence: e.shard.CadenceS})
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range crosses {
+		switch c.state {
+		case stateSilent:
+			s.emit(fmt.Sprintf("[shard %s] has gone silent", c.id))
+		case stateDark:
+			age := now.Sub(c.lastTime)
+			s.emit(fmt.Sprintf("[shard %s] goes dark: last breath %s ago (cadence %ds)", c.id, agoString(age), c.cadence))
+		}
+	}
+}
+
+func stateRank(state string) int {
+	switch state {
+	case stateSilent:
+		return 1
+	case stateDark:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func agoString(d time.Duration) string {
+	if d < time.Second {
+		return "0s"
+	}
+	return d.Round(time.Second).String()
+}
+
 // NewServer creates an empty whisper server
 func NewServer() *Server {
 	return &Server{
-		shards: make(map[string]*shardEntry),
-		eph:    make(map[string]ephSession),
+		shards:  make(map[string]*shardEntry),
+		pending: make(map[string][]*Task),
+		done:    make(map[string]TaskResult),
+		eph:     make(map[string]ephSession),
 	}
 }
 
@@ -116,8 +218,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleStart(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/whisper/v1/handshake/complete":
 		s.handleComplete(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/whisper/v1/word":
-		s.handleWord(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/whisper/v1/beat":
+		s.handleBeat(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -131,7 +233,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	session := randomHex(8)
 	s.mu.Lock()
-	s.eph[session] = ephSession{key: key, expires: time.Now().Add(ephTTL)}
+	now := time.Now()
+	for id, es := range s.eph {
+		if now.After(es.expires) {
+			delete(s.eph, id)
+		}
+	}
+	s.eph[session] = ephSession{key: key, expires: now.Add(ephTTL)}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, StartResp{
 		Session: session,
@@ -176,6 +284,40 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		hello.ID = randomHex(8)
 	}
 	now := time.Now()
+	s.mu.Lock()
+	existing, known := s.shards[hello.ID]
+	if known {
+		// a known shard returns: keep first seen, refresh the session and identity
+		sh := existing.shard
+		sh.SessionID = req.Session
+		sh.Hostname = hello.Hostname
+		sh.OS = hello.OS
+		sh.Arch = hello.Arch
+		sh.User = hello.User
+		sh.LastBreath = now
+		sh.CadenceS = defaultCadenceSec
+		s.shards[hello.ID] = &shardEntry{shard: sh, key: key, state: stateBreathing}
+		s.mu.Unlock()
+		s.emit(fmt.Sprintf("[shard %s] returns from the dark: %s/%s user=%s host=%s", hello.ID, hello.OS, hello.Arch, hello.User, hello.Hostname))
+	} else {
+		s.shards[hello.ID] = &shardEntry{
+			shard: Shard{
+				ID:         hello.ID,
+				SessionID:  req.Session,
+				Hostname:   hello.Hostname,
+				OS:         hello.OS,
+				Arch:       hello.Arch,
+				User:       hello.User,
+				FirstSeen:  now,
+				LastBreath: now,
+				CadenceS:   defaultCadenceSec,
+			},
+			key:   key,
+			state: stateBreathing,
+		}
+		s.mu.Unlock()
+		s.emit(fmt.Sprintf("[shard %s] registered: %s/%s user=%s host=%s", hello.ID, hello.OS, hello.Arch, hello.User, hello.Hostname))
+	}
 	ack := Ack{
 		ShardID:   hello.ID,
 		SessionID: req.Session,
@@ -183,23 +325,6 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		Server:    "sunder-overseer",
 		TS:        now.Unix(),
 	}
-	s.mu.Lock()
-	s.shards[hello.ID] = &shardEntry{
-		shard: Shard{
-			ID:         hello.ID,
-			SessionID:  req.Session,
-			Hostname:   hello.Hostname,
-			OS:         hello.OS,
-			Arch:       hello.Arch,
-			User:       hello.User,
-			FirstSeen:  now,
-			LastBreath: now,
-			CadenceS:   defaultCadenceSec,
-		},
-		key: key,
-	}
-	s.mu.Unlock()
-	s.emit(fmt.Sprintf("[shard %s] registered: %s/%s user=%s host=%s", hello.ID, hello.OS, hello.Arch, hello.User, hello.Hostname))
 	respEnv, err := Seal(key, mustJSON(ack))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -208,13 +333,8 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, respEnv)
 }
 
-type wordRequest struct {
-	ShardID  string   `json:"shard_id"`
-	Envelope Envelope `json:"envelope"`
-}
-
-func (s *Server) handleWord(w http.ResponseWriter, r *http.Request) {
-	var req wordRequest
+func (s *Server) handleBeat(w http.ResponseWriter, r *http.Request) {
+	var req BeatPost
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -228,33 +348,45 @@ func (s *Server) handleWord(w http.ResponseWriter, r *http.Request) {
 	}
 	plain, err := Open(entry.key, req.Envelope)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, errors.New("whisper: could not open word"))
+		writeErr(w, http.StatusUnauthorized, errors.New("whisper: could not open beat"))
 		return
 	}
-	var word Word
-	if err := json.Unmarshal(plain, &word); err != nil {
+	var beat BeatReq
+	if err := json.Unmarshal(plain, &beat); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	var res WordResult
-	switch word.Word {
-	case "breath":
-		now := time.Now()
-		s.mu.Lock()
-		entry.shard.LastBreath = now
-		s.mu.Unlock()
-		res = WordResult{Word: word.Word, OK: true, Result: "alive", TS: now.Unix()}
-		s.emit(fmt.Sprintf("[shard %s] breath: alive", word.ShardID))
-	default:
-		res = WordResult{Word: word.Word, OK: false, Result: "unknown word", TS: time.Now().Unix()}
-		s.emit(fmt.Sprintf("[shard %s] unknown word: %s", word.ShardID, word.Word))
+	now := time.Now()
+	s.mu.Lock()
+	entry.shard.LastBreath = now
+	entry.state = stateBreathing
+	if beat.Result != nil && beat.Result.TaskID != "" {
+		s.done[beat.Result.TaskID] = *beat.Result
 	}
-	respEnv, err := Seal(entry.key, mustJSON(res))
+	task := s.popTaskLocked(req.ShardID)
+	s.mu.Unlock()
+	ack := BeatAck{OK: true, TS: now.Unix(), Task: task}
+	respEnv, err := Seal(entry.key, mustJSON(ack))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, respEnv)
+}
+
+// popTaskLocked takes the oldest queued Task for a shard; the caller holds the lock
+func (s *Server) popTaskLocked(shardID string) *Task {
+	q := s.pending[shardID]
+	if len(q) == 0 {
+		return nil
+	}
+	task := q[0]
+	if len(q) == 1 {
+		delete(s.pending, shardID)
+	} else {
+		s.pending[shardID] = q[1:]
+	}
+	return task
 }
 
 func (s *Server) handleShards(w http.ResponseWriter, r *http.Request) {

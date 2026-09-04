@@ -33,7 +33,10 @@ The **Whisper v1 handshake over HTTPS** works end to end:
 On top of that wire, v0.2.0 adds the **Overseer console**: run the Overseer
 on a terminal and it drops you into `user@sunder:~$` with `shards`, `grasp`,
 `breath`, and `tone`, while Shard registrations and heartbeats narrate
-behind the prompt. The full design calls for the Noise protocol, dead drops,
+behind the prompt. v0.3.0 turns the wire into a loop: every beat carries
+the Shard's answer back and the next queued Word forward, so a grasped
+Shard can be spoken to with `utter`, `gaze`, `unfold`, `pulse`, and
+`anatomy`. The full design calls for the Noise protocol, dead drops,
 mesh relays, and the WASM fragment runtime; those land in later milestones.
 
 ## Quick start
@@ -55,6 +58,8 @@ rokuroo@sunder:~$ grasp 71d9d655
 You have its ear.
 rokuroo@sunder:~$ breath
 It breathes, shallow and patient.
+rokuroo@sunder:~$ utter echo hello
+hello
 ```
 
 Run `overseer -headless` to serve without the console, or `overseer -console`

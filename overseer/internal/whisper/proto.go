@@ -40,17 +40,37 @@ type Ack struct {
 	TS        int64  `json:"ts"`
 }
 
-// Word is a sealed task for a Shard
-type Word struct {
-	ShardID string            `json:"shard_id"`
-	Word    string            `json:"word"`
-	Args    map[string]string `json:"args,omitempty"`
+// Task is one Word queued for a Shard
+type Task struct {
+	ID   string            `json:"id"`
+	Word string            `json:"word"`
+	Args map[string]string `json:"args,omitempty"`
 }
 
-// WordResult is the sealed answer to a Word
-type WordResult struct {
+// TaskResult is the answer a Shard sends back for a finished Task
+type TaskResult struct {
+	TaskID string `json:"task_id"`
 	Word   string `json:"word"`
 	OK     bool   `json:"ok"`
 	Result string `json:"result"`
 	TS     int64  `json:"ts"`
+}
+
+// BeatReq is the sealed body of a Shard check in
+type BeatReq struct {
+	ShardID string      `json:"shard_id"`
+	Result  *TaskResult `json:"result,omitempty"`
+}
+
+// BeatAck is the sealed answer to a beat
+type BeatAck struct {
+	OK   bool  `json:"ok"`
+	TS   int64 `json:"ts"`
+	Task *Task `json:"task,omitempty"`
+}
+
+// BeatPost is the outer frame of a beat request
+type BeatPost struct {
+	ShardID  string   `json:"shard_id"`
+	Envelope Envelope `json:"envelope"`
 }
